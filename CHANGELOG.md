@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.17
+
+### Added
+
+* Add Home Assistant add-on and Docker Compose configuration entries for optional HTTP Basic Auth
+* Add Vitest coverage for output path and image format handling
+
+### Fixed
+
+* Preserve configured `jpeg` and `bmp` output formats when writing converted temp files
+* Force GraphicsMagick to write the configured output format instead of inferring PNG from temp paths
+
 ## 1.0.16
 
 ### Added
