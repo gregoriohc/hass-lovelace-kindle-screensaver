@@ -9,22 +9,15 @@ const puppeteer = require("puppeteer");
 const { CronJob } = require("cron");
 const gm = require("gm");
 const crypto = require("crypto");
+const {
+  getGraphicsMagickFormat,
+  resolveFinalTempPath,
+  resolveOutputPath,
+  resolveScreenshotTempPath
+} = require("./image-output");
 
 // keep state of current battery level and whether the device is charging
 const batteryStore = {};
-
-/**
- * Resolves the final output file path for a page, stripping duplicate extensions.
- * e.g. OUTPUT_PATH=/output/cover.png + IMAGE_FORMAT=png → /output/cover.png
- */
-function resolveOutputPath(pageConfig) {
-  let raw = pageConfig.outputPath;
-  const ext = `.${pageConfig.imageFormat}`;
-  if (raw.endsWith(ext)) {
-    raw = raw.slice(0, -ext.length);
-  }
-  return raw + ext;
-}
 
 // Helper function to calculate file hash
 async function getFileHash(filePath) {
@@ -350,7 +343,7 @@ async function renderAndConvertAsync(browser) {
     const outputPath = resolveOutputPath(pageConfig);
     await fsExtra.ensureDir(path.dirname(outputPath));
 
-    const tempPath = outputPath + ".temp";
+    const tempPath = resolveScreenshotTempPath(outputPath);
 
     console.log(`Rendering ${url} to image...`);
     await renderUrlToImageAsync(browser, pageConfig, url, tempPath);
@@ -362,7 +355,10 @@ async function renderAndConvertAsync(browser) {
 
     console.log(`Converting rendered screenshot of ${url} to grayscale...`);
 
-    const finalTempPath = outputPath + ".final.temp";
+    const finalTempPath = resolveFinalTempPath(
+      outputPath,
+      pageConfig.imageFormat
+    );
     try {
       await convertImageToKindleCompatiblePngAsync(
         pageConfig,
@@ -518,6 +514,7 @@ function convertImageToKindleCompatiblePngAsync(
       .options({
         imageMagick: config.useImageMagick === true
       })
+      .setFormat(getGraphicsMagickFormat(pageConfig.imageFormat))
       .gamma(pageConfig.removeGamma ? 1.0 / 2.2 : 1.0)
       .modulate(100, 100 * pageConfig.saturation)
       .contrast(pageConfig.contrast)
