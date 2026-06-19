@@ -4,6 +4,13 @@ function getEnvironmentVariable(key, suffix, fallbackValue) {
   return fallbackValue || process.env[key];
 }
 
+function parseIntegerEnvironmentVariable(key, fallbackValue) {
+  const value = process.env[key];
+  if (value === undefined || value === "") return fallbackValue;
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallbackValue;
+}
+
 function getPagesConfig() {
   const pages = [];
   let i = 0;
@@ -49,8 +56,8 @@ module.exports = {
   useImageMagick: process.env.USE_IMAGE_MAGICK === "true",
   pages: getPagesConfig(),
   port: process.env.PORT || 5000,
-  renderingTimeout: process.env.RENDERING_TIMEOUT || 10000,
-  browserLaunchTimeout: process.env.BROWSER_LAUNCH_TIMEOUT || 30000,
+  renderingTimeout: parseIntegerEnvironmentVariable("RENDERING_TIMEOUT", 10000),
+  browserLaunchTimeout: parseIntegerEnvironmentVariable("BROWSER_LAUNCH_TIMEOUT", 30000),
   language: process.env.LANGUAGE || "en",
   theme: process.env.HA_THEME ? { theme: process.env.HA_THEME } : null,
   debug: process.env.DEBUG === "true",

@@ -27,4 +27,7 @@ COPY *.js ./
 
 EXPOSE 5000
 
+HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
+    CMD node -e "require('http').get('http://127.0.0.1:' + (process.env.PORT || 5000) + '/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+
 CMD ["npm", "start"]
