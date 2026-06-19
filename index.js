@@ -6,7 +6,7 @@ const https = require("https");
 const { promises: fs } = require("fs");
 const fsExtra = require("fs-extra");
 const puppeteer = require("puppeteer");
-const { CronJob } = require("cron");
+const { CronJob, CronTime } = require("cron");
 const gm = require("gm");
 const crypto = require("crypto");
 const {
@@ -26,6 +26,15 @@ async function getFileHash(filePath) {
     return crypto.createHash('sha256').update(fileBuffer).digest('hex');
   } catch (error) {
     return null;
+  }
+}
+
+class OperationTimeoutError extends Error {
+  constructor(description, timeoutMs) {
+    super(`${description} timed out after ${timeoutMs}ms`);
+    this.name = "OperationTimeoutError";
+    this.description = description;
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -87,13 +96,43 @@ async function getFileHash(filePath) {
 
   // --- Render lock to prevent overlapping cron ticks ---
   let renderInProgress = false;
+  let renderStartedAt = null;
+  let activeRenderId = 0;
   let initInProgress = false;
   let browser = null;
+  const appStartedAt = Date.now();
+  let lastSuccessfulRenderAt = null;
+
+  const renderJobTimeout = getRenderJobTimeout();
+  const healthcheckMaxAge = getHealthcheckMaxAge(renderJobTimeout);
+
+  const closeCurrentBrowser = async (reason) => {
+    if (!browser) {
+      return;
+    }
+
+    const browserToClose = browser;
+    browser = null;
+    console.error(`Closing browser after ${reason}`);
+    await closeBrowser(browserToClose, reason);
+  };
 
   const safeRender = async () => {
     if (renderInProgress) {
-      console.log("Render already in progress, skipping tick");
-      return;
+      const lockAge = renderStartedAt ? Date.now() - renderStartedAt : 0;
+      if (lockAge <= renderJobTimeout) {
+        console.log(
+          `Render already in progress for ${lockAge}ms, skipping tick`
+        );
+        return;
+      }
+
+      console.error(
+        `Render lock is stale after ${lockAge}ms, resetting browser and continuing`
+      );
+      await closeCurrentBrowser("stale render lock");
+      renderInProgress = false;
+      renderStartedAt = null;
     }
     if (!browser) {
       await initBrowser();
@@ -102,13 +141,32 @@ async function getFileHash(filePath) {
         return;
       }
     }
+
+    const renderId = ++activeRenderId;
+    const currentBrowser = browser;
     renderInProgress = true;
+    renderStartedAt = Date.now();
+    let timedOut = false;
     try {
-      await renderAndConvertAsync(browser);
+      await withTimeout(
+        renderAndConvertAsync(currentBrowser),
+        renderJobTimeout,
+        "render job",
+        () => {
+          timedOut = true;
+        }
+      );
+      lastSuccessfulRenderAt = Date.now();
     } catch (err) {
       console.error("Render job failed but server stays alive:", err);
+      if (timedOut || err instanceof OperationTimeoutError) {
+        await closeCurrentBrowser("render timeout");
+      }
     } finally {
-      renderInProgress = false;
+      if (activeRenderId === renderId) {
+        renderInProgress = false;
+        renderStartedAt = null;
+      }
     }
   };
 
@@ -118,6 +176,38 @@ async function getFileHash(filePath) {
   }
 
   const httpServer = http.createServer(async (request, response) => {
+    // Parse the request
+    const url = new URL(request.url, `http://${request.headers.host}`);
+
+    if (url.pathname === "/health") {
+      const now = Date.now();
+      const age = lastSuccessfulRenderAt ? now - lastSuccessfulRenderAt : null;
+      const startupAge = now - appStartedAt;
+      const isHealthy =
+        lastSuccessfulRenderAt !== null
+          ? age <= healthcheckMaxAge
+          : startupAge <= healthcheckMaxAge;
+
+      const payload = JSON.stringify({
+        status: isHealthy ? "ok" : "stale",
+        renderInProgress,
+        renderInProgressFor: renderStartedAt ? now - renderStartedAt : null,
+        lastSuccessfulRenderAt: lastSuccessfulRenderAt
+          ? new Date(lastSuccessfulRenderAt).toISOString()
+          : null,
+        lastSuccessfulRenderAge: age,
+        maxAge: healthcheckMaxAge
+      });
+
+      response.writeHead(isHealthy ? 200 : 503, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+        "Cache-Control": "no-cache"
+      });
+      response.end(payload);
+      return;
+    }
+
     // Check basic auth if configured
     if (requireAuth) {
       const authHeader = request.headers.authorization;
@@ -136,8 +226,6 @@ async function getFileHash(filePath) {
       }
     }
 
-    // Parse the request
-    const url = new URL(request.url, `http://${request.headers.host}`);
     // Check the page number
     const pageNumberStr = url.pathname;
     // and get the battery level, if any
@@ -287,7 +375,9 @@ async function getFileHash(filePath) {
 
       browser = nextBrowser;
       browser.on("disconnected", () => {
-        browser = null;
+        if (browser === nextBrowser) {
+          browser = null;
+        }
       });
       return browser;
     } catch (err) {
@@ -334,78 +424,99 @@ async function getFileHash(filePath) {
 })();
 
 async function renderAndConvertAsync(browser) {
+  let failedPages = 0;
+
   for (let pageIndex = 0; pageIndex < config.pages.length; pageIndex++) {
     const pageConfig = config.pages[pageIndex];
     const pageBatteryStore = batteryStore[pageIndex];
 
     const url = `${config.baseUrl}${pageConfig.screenShotUrl}`;
-
     const outputPath = resolveOutputPath(pageConfig);
-    await fsExtra.ensureDir(path.dirname(outputPath));
-
     const tempPath = resolveScreenshotTempPath(outputPath);
-
-    console.log(`Rendering ${url} to image...`);
-    await renderUrlToImageAsync(browser, pageConfig, url, tempPath);
-
-    if (!(await fsExtra.pathExists(tempPath))) {
-      console.error(`Screenshot missing: ${tempPath}`);
-      continue;
-    }
-
-    console.log(`Converting rendered screenshot of ${url} to grayscale...`);
-
     const finalTempPath = resolveFinalTempPath(
       outputPath,
       pageConfig.imageFormat
     );
+
     try {
-      await convertImageToKindleCompatiblePngAsync(
-        pageConfig,
-        tempPath,
-        finalTempPath
-      );
+      await fsExtra.ensureDir(path.dirname(outputPath));
 
-      // Compare with existing image — only update if changed
-      let hasChanged = true;
-      if (await fsExtra.pathExists(outputPath)) {
-        const newHash = await getFileHash(finalTempPath);
-        const existingHash = await getFileHash(outputPath);
+      console.log(`Rendering ${url} to image...`);
+      await renderUrlToImageAsync(browser, pageConfig, url, tempPath);
 
-        if (newHash && existingHash && newHash === existingHash) {
-          hasChanged = false;
-          console.log(`Image unchanged for ${url}, skipping update`);
-        } else {
-          console.log(`Image changed for ${url}, updating`);
-        }
-      } else {
-        console.log(`First render for ${url}, creating image`);
+      if (!(await fsExtra.pathExists(tempPath))) {
+        throw new Error(`Screenshot missing: ${tempPath}`);
       }
 
-      if (hasChanged) {
-        await fsExtra.move(finalTempPath, outputPath, { overwrite: true });
+      console.log(`Converting rendered screenshot of ${url} to grayscale...`);
+
+      try {
+        await withTimeout(
+          convertImageToKindleCompatiblePngAsync(
+            pageConfig,
+            tempPath,
+            finalTempPath
+          ),
+          config.renderingTimeout,
+          `convert ${url}`
+        );
+
+        // Compare with existing image — only update if changed
+        let hasChanged = true;
+        if (await fsExtra.pathExists(outputPath)) {
+          const newHash = await getFileHash(finalTempPath);
+          const existingHash = await getFileHash(outputPath);
+
+          if (newHash && existingHash && newHash === existingHash) {
+            hasChanged = false;
+            console.log(`Image unchanged for ${url}, skipping update`);
+          } else {
+            console.log(`Image changed for ${url}, updating`);
+          }
+        } else {
+          console.log(`First render for ${url}, creating image`);
+        }
+
+        if (hasChanged) {
+          await withTimeout(
+            fsExtra.move(finalTempPath, outputPath, { overwrite: true }),
+            config.renderingTimeout,
+            `replace output for ${url}`
+          );
+        }
+      } finally {
+        // Always clean up temp files
+        await fsExtra.remove(tempPath).catch(() => {});
+        await fsExtra.remove(finalTempPath).catch(() => {});
+      }
+
+      console.log(`Finished ${url}`);
+
+      if (
+        pageBatteryStore &&
+        pageBatteryStore.batteryLevel !== null &&
+        pageConfig.batteryWebHook
+      ) {
+        sendBatteryLevelToHomeAssistant(
+          pageIndex,
+          pageBatteryStore,
+          pageConfig.batteryWebHook
+        );
       }
     } catch (err) {
-      console.error(`Convert/replace failed for ${url}, keeping previous image:`, err);
+      failedPages++;
+      console.error(
+        `Render failed for ${url}, keeping previous image:`,
+        err
+      );
     } finally {
-      // Always clean up temp files
       await fsExtra.remove(tempPath).catch(() => {});
       await fsExtra.remove(finalTempPath).catch(() => {});
     }
+  }
 
-    console.log(`Finished ${url}`);
-
-    if (
-      pageBatteryStore &&
-      pageBatteryStore.batteryLevel !== null &&
-      pageConfig.batteryWebHook
-    ) {
-      sendBatteryLevelToHomeAssistant(
-        pageIndex,
-        pageBatteryStore,
-        pageConfig.batteryWebHook
-      );
-    }
+  if (failedPages > 0) {
+    throw new Error(`${failedPages} render page(s) failed`);
   }
 }
 
@@ -442,13 +553,21 @@ function sendBatteryLevelToHomeAssistant(
 async function renderUrlToImageAsync(browser, pageConfig, url, path) {
   let page;
   try {
-    page = await browser.newPage();
-    await page.emulateMediaFeatures([
-      {
-        name: "prefers-color-scheme",
-        value: `${pageConfig.prefersColorScheme}`
-      }
-    ]);
+    page = await withTimeout(
+      browser.newPage(),
+      config.renderingTimeout,
+      `open browser page for ${url}`
+    );
+    await withTimeout(
+      page.emulateMediaFeatures([
+        {
+          name: "prefers-color-scheme",
+          value: `${pageConfig.prefersColorScheme}`
+        }
+      ]),
+      config.renderingTimeout,
+      `emulate media for ${url}`
+    );
 
     let size = {
       width: Number(pageConfig.renderingScreenSize.width),
@@ -462,44 +581,66 @@ async function renderUrlToImageAsync(browser, pageConfig, url, path) {
       };
     }
 
-    await page.setViewport(size);
+    await withTimeout(
+      page.setViewport(size),
+      config.renderingTimeout,
+      `set viewport for ${url}`
+    );
     const startTime = new Date().valueOf();
+    console.log(`Navigating to ${url}...`);
     await page.goto(url, {
       waitUntil: ["domcontentloaded", "load", "networkidle0"],
       timeout: config.renderingTimeout
     });
 
     const navigateTimespan = new Date().valueOf() - startTime;
+    console.log(`Waiting for home-assistant root on ${url}...`);
     await page.waitForSelector("home-assistant", {
       timeout: Math.max(config.renderingTimeout - navigateTimespan, 1000)
     });
 
-    await page.addStyleTag({
-      content: `
-        body {
-          zoom: ${pageConfig.scaling * 100}%;
-          overflow: hidden;
-        }`
-    });
+    await withTimeout(
+      page.addStyleTag({
+        content: `
+          body {
+            zoom: ${pageConfig.scaling * 100}%;
+            overflow: hidden;
+          }`
+      }),
+      config.renderingTimeout,
+      `add page style for ${url}`
+    );
 
     if (pageConfig.renderingDelay > 0) {
       await page.waitForTimeout(pageConfig.renderingDelay);
     }
-    await page.screenshot({
-      path,
-      type: 'png', // Always use PNG for screenshot
-      captureBeyondViewport: false,
-      clip: {
-        x: 0,
-        y: 0,
-        ...size
-      }
-    });
+    console.log(`Taking screenshot of ${url}...`);
+    await withTimeout(
+      page.screenshot({
+        path,
+        type: 'png', // Always use PNG for screenshot
+        captureBeyondViewport: false,
+        clip: {
+          x: 0,
+          y: 0,
+          ...size
+        }
+      }),
+      config.renderingTimeout,
+      `screenshot ${url}`
+    );
   } catch (e) {
-    console.error("Failed to render", e);
+    console.error(`Failed to render ${url}:`, e);
+    throw e;
   } finally {
-    if (config.debug === false) {
-      await page.close();
+    if (config.debug === false && page) {
+      await withTimeout(
+        page.close(),
+        5000,
+        `close browser page for ${url}`
+      ).catch((err) => {
+        console.error(`Failed to close browser page for ${url}:`, err);
+      });
     }
   }
 }
@@ -512,7 +653,8 @@ function convertImageToKindleCompatiblePngAsync(
   return new Promise((resolve, reject) => {
     let gmInstance = gm(inputPath)
       .options({
-        imageMagick: config.useImageMagick === true
+        imageMagick: config.useImageMagick === true,
+        timeout: config.renderingTimeout
       })
       .setFormat(getGraphicsMagickFormat(pageConfig.imageFormat))
       .gamma(pageConfig.removeGamma ? 1.0 / 2.2 : 1.0)
@@ -540,4 +682,68 @@ function convertImageToKindleCompatiblePngAsync(
       }
     });
   });
+}
+
+function withTimeout(promise, timeoutMs, description, onTimeout) {
+  let timeoutId;
+  const timeoutPromise = new Promise((resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      if (onTimeout) {
+        onTimeout();
+      }
+      reject(new OperationTimeoutError(description, timeoutMs));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeoutId);
+  });
+}
+
+function getRenderJobTimeout() {
+  const pageTimeoutBudget = config.pages.reduce((total, pageConfig) => {
+    return (
+      total +
+      config.renderingTimeout +
+      getNumber(pageConfig.renderingDelay, 0) +
+      30000
+    );
+  }, 0);
+
+  return Math.max(pageTimeoutBudget, config.renderingTimeout + 30000);
+}
+
+function getHealthcheckMaxAge(renderJobTimeout) {
+  const defaultCronInterval = 60000;
+
+  try {
+    const cronTime = new CronTime(config.cronJob);
+    const nextDates = cronTime.sendAt(2);
+    const cronInterval = nextDates[1].valueOf() - nextDates[0].valueOf();
+
+    if (Number.isFinite(cronInterval) && cronInterval > 0) {
+      return cronInterval + renderJobTimeout;
+    }
+  } catch (err) {
+    console.error("Failed to derive healthcheck age from cron, using fallback:", err);
+  }
+
+  return defaultCronInterval + renderJobTimeout;
+}
+
+function getNumber(value, fallbackValue) {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : fallbackValue;
+}
+
+async function closeBrowser(browser, reason) {
+  try {
+    await withTimeout(browser.close(), 5000, `close browser after ${reason}`);
+  } catch (err) {
+    console.error(`Failed to close browser after ${reason}:`, err);
+    const browserProcess = browser.process && browser.process();
+    if (browserProcess) {
+      browserProcess.kill("SIGKILL");
+    }
+  }
 }
