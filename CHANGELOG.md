@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.18
+
+### Added
+
+* Add a render health endpoint and wire Docker/Home Assistant health checks to detect stale renders
+
+### Fixed
+
+* Recover from stale render locks by bounding render jobs and restarting Chromium after render timeouts
+* Add step-level render, screenshot, conversion, and file replacement timeouts with clearer error logging
+
 ## 1.0.17
 
 ### Added
