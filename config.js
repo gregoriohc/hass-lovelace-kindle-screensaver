@@ -27,6 +27,17 @@ function getPagesConfig() {
         `output/cover${suffix}`
       ),
       renderingDelay: getEnvironmentVariable("RENDERING_DELAY", suffix) || 0,
+      // Condition-based waiting: wait until the Lovelace dashboard has actually
+      // rendered (content present + no spinners + images loaded + DOM stable)
+      // instead of relying solely on the fixed renderingDelay above.
+      waitForContent:
+        getEnvironmentVariable("RENDERING_WAIT_FOR_CONTENT", suffix) !== "false",
+      // Max time (ms) to wait for the dashboard content to become ready/stable.
+      stabilityTimeout:
+        getEnvironmentVariable("RENDERING_STABILITY_TIMEOUT", suffix) || 30000,
+      // How long (ms) the rendered DOM must stay unchanged to be considered stable.
+      stabilityPeriod:
+        getEnvironmentVariable("RENDERING_STABILITY_PERIOD", suffix) || 1500,
       renderingScreenSize: {
         height:
           getEnvironmentVariable("RENDERING_SCREEN_HEIGHT", suffix) || 800,
