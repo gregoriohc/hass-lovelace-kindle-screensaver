@@ -611,6 +611,19 @@ async function renderUrlToImageAsync(browser, pageConfig, url, path) {
       `add page style for ${url}`
     );
 
+    // Wait for the Lovelace dashboard to actually finish rendering before the
+    // screenshot. `networkidle0` and the `home-assistant` shell appear long
+    // before the cards are populated (HA streams state over a WebSocket, which
+    // networkidle does not track), so a screenshot taken too early captures a
+    // half-rendered dashboard. We poll the real content through the shadow DOM
+    // and wait until it is present, free of loading indicators, and stable.
+    if (pageConfig.waitForContent) {
+      await waitForDashboardReady(page, pageConfig, url);
+    }
+
+    // `renderingDelay` is kept as an optional final settle buffer (e.g. for
+    // animations or custom cards that paint after becoming stable). It is no
+    // longer the primary readiness mechanism.
     if (pageConfig.renderingDelay > 0) {
       await page.waitForTimeout(pageConfig.renderingDelay);
     }
@@ -642,6 +655,108 @@ async function renderUrlToImageAsync(browser, pageConfig, url, path) {
         console.error(`Failed to close browser page for ${url}:`, err);
       });
     }
+  }
+}
+
+// Probe the page (in the browser context) for dashboard readiness signals,
+// piercing every shadow root. Returns counts the Node side uses to decide
+// whether the Lovelace view has finished rendering and stabilised.
+function probeDashboardReadiness() {
+  let deepCount = 0;
+  let spinners = 0;
+  let pendingImages = 0;
+  let huiView = null;
+
+  const visit = (root) => {
+    const els = root.querySelectorAll("*");
+    for (const el of els) {
+      deepCount++;
+      const tag = el.tagName.toLowerCase();
+      if (tag === "hui-view") {
+        huiView = el;
+      } else if (
+        tag === "ha-circular-progress" ||
+        tag === "ha-spinner" ||
+        tag === "mwc-circular-progress"
+      ) {
+        spinners++;
+      } else if (tag === "img" && (!el.complete || el.naturalWidth === 0)) {
+        pendingImages++;
+      }
+      if (el.shadowRoot) {
+        visit(el.shadowRoot);
+      }
+    }
+  };
+  visit(document);
+
+  return {
+    deepCount,
+    spinners,
+    pendingImages,
+    hasContent: !!huiView && huiView.childElementCount > 0
+  };
+}
+
+// Condition-based waiting: instead of guessing with a fixed delay, poll the
+// real rendered dashboard until it is present, free of loading indicators,
+// images are loaded, and the DOM has stopped changing for `stabilityPeriod`.
+async function waitForDashboardReady(page, pageConfig, url) {
+  const timeoutMs = getNumber(pageConfig.stabilityTimeout, 30000);
+  const stabilityPeriod = getNumber(pageConfig.stabilityPeriod, 1500);
+  const pollInterval = 250;
+
+  const startTime = Date.now();
+  let contentSeen = false;
+  let lastCount = -1;
+  let stableSince = null;
+
+  console.log(`Waiting for dashboard content to render on ${url}...`);
+
+  while (true) {
+    const status = await page.evaluate(probeDashboardReadiness);
+
+    if (status.hasContent) {
+      contentSeen = true;
+
+      const settled = status.spinners === 0 && status.pendingImages === 0;
+      if (settled && status.deepCount === lastCount) {
+        if (stableSince === null) {
+          stableSince = Date.now();
+        } else if (Date.now() - stableSince >= stabilityPeriod) {
+          console.log(
+            `Dashboard ready on ${url} (elements: ${status.deepCount}, ` +
+              `waited ${Date.now() - startTime}ms)`
+          );
+          return;
+        }
+      } else {
+        // Something is still changing/loading — reset the stability window.
+        stableSince = null;
+      }
+      lastCount = status.deepCount;
+    }
+
+    if (Date.now() - startTime > timeoutMs) {
+      if (contentSeen) {
+        // Content rendered but never fully stabilised (e.g. a perpetually
+        // animating card). Proceed with the screenshot anyway — a slightly
+        // imperfect shot beats none.
+        console.warn(
+          `Dashboard content not fully stable on ${url} after ${timeoutMs}ms ` +
+            `(spinners/images/DOM still changing), taking screenshot anyway`
+        );
+        return;
+      }
+      // Content never appeared — likely auth expired or HA unreachable. Throw so
+      // the caller keeps the previous good image instead of capturing a blank.
+      throw new OperationTimeoutError(
+        `dashboard content for ${url}`,
+        timeoutMs
+      );
+    }
+
+    await new Promise((r) => setTimeout(r, pollInterval));
   }
 }
 
